@@ -1,0 +1,282 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+
+
+# Try to import XGBoost if available
+xgb_available = True
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    xgb_available = False
+
+# -----------------------------
+# 2) Basic checks
+# -----------------------------
+required_columns = [
+    "age","age_group","anaemia","creatinine_phosphate","diabetes","ejection_fraction",
+    "high_blood_pressure","serum_creatinine","serum_sodium","gender","locality",
+    "marital_status","lifestyle","sleep","category","depression","hyperlipi"
+]
+missing_cols = [c for c in required_columns if c not in df.columns]
+if missing_cols:
+    raise ValueError(f"Missing expected columns in CSV: {missing_cols}")
+
+# Ensure no nulls (as per dataset guarantee)
+if df.isna().sum().sum() > 0:
+    raise ValueError("Dataset contains missing values. Please ensure there are no nulls.")
+
+# -----------------------------
+# 3) Create a synthetic target: mortality (0/1)
+#    We derive a plausible risk-based probability using available fields,
+#    then sample a mortality label from that probability.
+# -----------------------------
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+# Build a risk score using domain-inspired heuristics
+z = np.full(shape=(len(df),), fill_value=-4.0, dtype=float)
+
+z += 0.03 * (df["age"].to_numpy() - 60)  # older age -> higher risk
+z += (df["category"].to_numpy() == "Heart Failure").astype(float) * 0.9
+z += (df["category"].to_numpy() == "At Risk").astype(float) * 0.5
+z += (df["ejection_fraction"].to_numpy() < 35).astype(float) * 1.2
+z += (df["serum_sodium"].to_numpy() < 135).astype(float) * 0.8
+z += (df["serum_creatinine"].to_numpy() > 1.5).astype(float) * 0.9
+z += (df["anaemia"].to_numpy() == "Yes").astype(float) * 0.3
+z += (df["diabetes"].to_numpy() == "Yes").astype(float) * 0.25
+z += (df["high_blood_pressure"].to_numpy() == "Yes").astype(float) * 0.25
+z += (df["depression"].to_numpy() == "Yes").astype(float) * 0.2
+z += (df["hyperlipi"].to_numpy() == "Yes").astype(float) * 0.15
+z += (df["sleep"].to_numpy() < 6).astype(float) * 0.2
+
+proba = sigmoid(z)
+
+rng = np.random.default_rng(7)
+mortality = rng.binomial(n=1, p=proba, size=len(df)).astype(int)
+
+# Guarantee both classes exist
+if mortality.sum() == 0:
+    mortality[rng.choice(len(mortality), size=max(1, len(mortality)//200), replace=False)] = 1
+elif mortality.sum() == len(mortality):
+    idx = rng.choice(len(mortality), size=max(1, len(mortality)//200), replace=False)
+    mortality[idx] = 0
+
+df["mortality"] = mortality
+
+# -----------------------------
+# 4) Feature/target split and preprocessing
+# -----------------------------
+target = "mortality"
+feature_cols = [
+    "age","age_group","anaemia","creatinine_phosphate","diabetes","ejection_fraction",
+    "high_blood_pressure","serum_creatinine","serum_sodium","gender","locality",
+    "marital_status","lifestyle","sleep","category","depression","hyperlipi"
+]
+
+X = df[feature_cols].copy()
+y = df[target].copy()
+
+# Define which columns are numeric vs categorical
+numeric_features = ["age","creatinine_phosphate","ejection_fraction","serum_creatinine","serum_sodium","sleep"]
+categorical_features = ["age_group","anaemia","diabetes","high_blood_pressure","gender",
+                        "locality","marital_status","lifestyle","category","depression","hyperlipi"]
+
+# Preprocess: scale numeric, one-hot encode categorical
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", StandardScaler(), numeric_features),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+    ]
+)
+
+# -----------------------------
+# 5) Train/test split
+# -----------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+
+# -----------------------------
+# 6) Define models
+# -----------------------------
+models = {
+    "LogReg": LogisticRegression(max_iter=2000, n_jobs=None, solver="lbfgs"),
+    "SVM": SVC(kernel="rbf", probability=False),  # not using probs for metrics here
+    "RandomForest": RandomForestClassifier(n_estimators=300, random_state=42),
+    "KNN": KNeighborsClassifier(n_neighbors=15),
+    "ANN(MLP)": MLPClassifier(hidden_layer_sizes=(64, 32), activation="relu", max_iter=400, random_state=42),
+}
+
+if xgb_available:
+    models["XGBoost"] = XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.1,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=0
+    )
+
+# -----------------------------
+# 7) Train and evaluate
+# -----------------------------
+metrics_summary = []
+reports = {}
+
+for name, clf in models.items():
+    pipe = Pipeline(steps=[("preprocess", preprocess), ("model", clf)])
+    pipe.fit(X_train, y_train)
+    y_pred = pipe.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+
+    metrics_summary.append({"model": name, "accuracy": acc, "precision": prec, "recall": rec, "f1": f1})
+    reports[name] = classification_report(y_test, y_pred, digits=4, zero_division=0)
+
+metrics_df = pd.DataFrame(metrics_summary).sort_values(by="f1", ascending=False).reset_index(drop=True)
+print("=== Metrics Summary ===")
+print(metrics_df.to_string(index=False))
+print("\n=== Classification Reports ===")
+for name in models:
+    print(f"\n--- {name} ---")
+    print(reports[name])
+
+# -----------------------------
+# 8) Visualizations
+# NOTE: One figure per chart, no subplots, no explicit color settings.
+# -----------------------------
+
+# 8.1 Pie chart of class distribution
+plt.figure()
+class_counts = df["mortality"].value_counts().sort_index()
+labels = [f"Class {i}" for i in class_counts.index]
+plt.pie(class_counts.values, labels=labels, autopct="%1.1f%%")
+plt.title("Mortality Class Distribution")
+plt.tight_layout()
+plt.savefig("mortality_class_distribution.png", dpi=200)
+plt.show()
+
+# 8.2 Correlation heat map (numeric features only)
+plt.figure()
+num_df = df[numeric_features + ["mortality"]].copy()
+corr = num_df.corr(numeric_only=True)
+im = plt.imshow(corr.values, aspect="auto")
+plt.xticks(ticks=np.arange(len(corr.columns)), labels=corr.columns, rotation=45, ha="right")
+plt.yticks(ticks=np.arange(len(corr.index)), labels=corr.index)
+plt.colorbar(im, fraction=0.046, pad=0.04)
+plt.title("Correlation Heat Map (Numeric Features)")
+plt.tight_layout()
+plt.savefig("correlation_heatmap.png", dpi=200)
+plt.show()
+
+# 8.3 Model performance bar charts
+def plot_bar(metric_name):
+    plt.figure()
+    plt.bar(metrics_df["model"], metrics_df[metric_name])
+    plt.ylabel(metric_name.capitalize())
+    plt.xlabel("Model")
+    plt.title(f"Model {metric_name.capitalize()} Comparison")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(f"model_{metric_name}_comparison.png", dpi=200)
+    plt.show()
+
+for m in ["accuracy", "precision", "recall", "f1"]:
+    plot_bar(m)
+
+# 8.4 Feature importance bar graphs for tree-based models (if possible)
+# Extract transformed feature names from the preprocessor
+def get_feature_names(preprocessor):
+    num_names = numeric_features
+    cat_encoder = preprocessor.named_transformers_["cat"]
+    cat_names = list(cat_encoder.get_feature_names_out(categorical_features))
+    return list(num_names) + cat_names
+
+feature_names = None
+
+# Random Forest feature importances
+if "RandomForest" in models:
+    rf_pipe = Pipeline(steps=[("preprocess", preprocess), ("model", models["RandomForest"])])
+    rf_pipe.fit(X_train, y_train)
+    feature_names = get_feature_names(rf_pipe.named_steps["preprocess"])
+    importances = rf_pipe.named_steps["model"].feature_importances_
+    idx = np.argsort(importances)[::-1][:20]  # top 20
+    plt.figure()
+    plt.bar([feature_names[i] for i in idx], importances[idx])
+    plt.xticks(rotation=90)
+    plt.ylabel("Importance")
+    plt.title("RandomForest Top 20 Feature Importances")
+    plt.tight_layout()
+    plt.savefig("rf_feature_importances.png", dpi=200)
+    plt.show()
+
+# XGBoost feature importances
+if xgb_available and "XGBoost" in models:
+    xgb_pipe = Pipeline(steps=[("preprocess", preprocess), ("model", models["XGBoost"])])
+    xgb_pipe.fit(X_train, y_train)
+    feature_names = get_feature_names(xgb_pipe.named_steps["preprocess"])
+    importances = xgb_pipe.named_steps["model"].feature_importances_
+    idx = np.argsort(importances)[::-1][:20]
+    plt.figure()
+    plt.bar([feature_names[i] for i in idx], importances[idx])
+    plt.xticks(rotation=90)
+    plt.ylabel("Importance")
+    plt.title("XGBoost Top 20 Feature Importances")
+    plt.tight_layout()
+    plt.savefig("xgb_feature_importances.png", dpi=200)
+    plt.show()
+
+print("\nAll figures saved to the current folder:")
+print(" - mortality_class_distribution.png")
+print(" - correlation_heatmap.png")
+print(" - model_accuracy_comparison.png")
+print(" - model_precision_comparison.png")
+print(" - model_recall_comparison.png")
+print(" - model_f1_comparison.png")
+print(" - rf_feature_importances.png (if RandomForest plotted)")
+print(" - xgb_feature_importances.png (if XGBoost plotted)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
